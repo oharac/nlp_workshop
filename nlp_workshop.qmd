@@ -44,10 +44,12 @@ The `synthesisr` package is our friend here, reading and writing bibliography fi
 ```{r read in data}
 refs_df_raw <- synthesisr::read_refs(here::here('data/wos_240419.bib'))
 
+set.seed(42) ### so we always get the same sample
 refs_df <- refs_df_raw %>%
   select(type, author, title, journal, year, keywords, abstract, times_cited) %>%
   mutate(times_cited = as.numeric(times_cited)) %>%
   filter(!is.na(abstract)) %>%
+  # slice_sample(n = 300) %>%
   mutate(doc_id = paste0('text', 1:n()))
 ```
 
@@ -97,7 +99,7 @@ Unfortunately lemmatization is not easy, but there are packages and external sof
 For our purposes, I did this in advance in case you didn't feel like installing Python and such.  Check the results - note that this lemmatization software does not simply treat the abstracts as "bags of words" but accounts for grammar/parts of speech etc. in context.
 
 ```{r}
-abstr_parsed_f <- here::here('data/abstr_parsed.csv')
+abstr_parsed_f <- here::here('int/abstr_parsed.csv')
 if(!file.exists(abstr_parsed_f)) {
   library(spacyr)
   
@@ -180,6 +182,8 @@ LDA is a handy method for classifying documents without any additional info othe
 
 One way to think of it: each document is a probabilistic mixture of _one or more_ topics.  For our documents based on social-ecological systems, some topics might be fisheries, forestry, water systems, or comanagement.  For each of these topics, certain words will be more or less strongly associated with it - for these topics, perhaps "water" is strongly associated with fisheries and water systems, but weakly associated with forestry.  We don't know the topics in advance (thus "latent") but we can cluster according to word associations among the documents, and then look at those word associations to tease out what the topics might be.
 
+## Get data into proper format
+
 First, let's start with our dataframe of lemmatized abstracts, but clean it up a bit since more words (including uninformative stop words) makes it take a lot longer.  Then we will cast this to a "Document Term Matrix" that summarizes how many times each word shows up in each document (similar, but not the same, as TF-IDF) - each row a document, each column a word, and each cell the number of times that word shows up in that document.  
 
 ```{r}
@@ -198,61 +202,112 @@ abstr_dtm <- cast_dtm(data = abstr_clean_df,
                       value = n)
 ```
 
-Then we feed that to the LDA function to optimize its topic clusters.  But first, we need to know how many clusters we would like it to find!  From https://www.mathworks.com/help/textanalytics/ug/choose-number-of-topics-for-LDA-model.html:
+## How many topics?
+
+Then we feed that to the LDA function to optimize its topic clusters.  But first, we need to know how many clusters we would like it to find!  
+
+### Perplexity score
+
+From https://www.mathworks.com/help/textanalytics/ug/choose-number-of-topics-for-LDA-model.html:
 
 > To decide on a suitable number of topics, you can compare the goodness-of-fit of LDA models fit with varying numbers of topics. You can evaluate the goodness-of-fit of an LDA model by calculating the perplexity of a held-out set of documents. The perplexity indicates how well the model describes a set of documents. A lower perplexity suggests a better fit.
 
+This code chunk runs a cross validation on a subset of the overall corpus, trying LDA on a training set for a range of k values, then testing perplexity against a test set,
+
 ```{r k optimization create training and testing document-term matrices}
-k_optim_file <- here('int', 'perplexity_vs_k.csv')
+k_optim_file <- here::here('int', 'perplexity_vs_k.csv')
 
 if(!file.exists(k_optim_file)) {
-  set.seed(42)
-  test_ids <- refs_df %>%
+  set.seed(12345)
+  refs_subset <- refs_df # %>%
+    # slice_sample(n = 500)
+  
+  test_ids <- refs_subset %>%
     slice_sample(prop = .2, replace = FALSE) %>%
     .$doc_id
   
-  train_ids <- refs_df %>%
+  train_ids <- refs_subset %>%
     filter(!doc_id %in% test_ids) %>%
     .$doc_id
   
   # abstr_expand_df <- abstr_clean_df %>%
   #   complete(doc_id, lemma, fill = list(n = 0))
   
-  k_optim_test_dtm <- abstr_clean_df %>%
+  test_dtm <- abstr_clean_df %>%
     filter(doc_id %in% test_ids) %>%
     cast_dtm(term = lemma, document = doc_id, value = n)
-  k_optim_train_dtm <- abstr_clean_df %>%
+  train_dtm <- abstr_clean_df %>%
     filter(doc_id %in% train_ids) %>%
     cast_dtm(term = lemma, document = doc_id, value = n)
 
-  k_vec <- c(2:10)
+  k_vec <- c(2:10, seq(12, 20, 2), seq(25, 40, 5))
   
-  perp_vs_k_df <- lapply(k_vec, 
-    FUN = function(k) {
-      ### k <- k_vec[2]
-      message('Processing LDA for k = ', k, '...')
-      system.time({
-      k_optim_lda <- topicmodels::LDA(k_optim_train_dtm, k = k)
-      })
-      perp <- perplexity(object = k_optim_lda, newdata = k_optim_test_dtm)
-      
-      return(data.frame(k = k, perplexity = perp))
-    }) %>%
+  perp_fxn <- function(k, train_dtm, test_dtm) {
+    message('Processing LDA for k = ', k, '...')
+    
+    lda_out <- topicmodels::LDA(train_dtm, k = k)
+    perp <- perplexity(object = lda_out, newdata = test_dtm)
+    
+    return(data.frame(k = k, perplexity = perp))
+  }
+  
+  perp_vs_k_df <- purrr::map_df(k_vec, perp_fxn, 
+                                train_dtm = train_dtm, test_dtm = test_dtm) %>%
     bind_rows() %>%
     arrange(k)
+  
   write_csv(perp_vs_k_df, k_optim_file)
 }
+
 perp_vs_k_df <- read_csv(k_optim_file)
 ggplot(perp_vs_k_df, aes(x = k, y = perplexity)) +
   geom_line(linewidth = 1, color = hcl.colors(1)) +
-  geom_vline(xintercept = c(10, 20), linewidth = .5, linetype = 'dashed', color = hcl.colors(1)) +
-  geom_text(x = 9, y = 2410, label = 'k = 10', color = hcl.colors(1), angle = 90, hjust = 0, vjust = 0) +
-  geom_text(x = 19, y = 2410, label = 'k = 20', color = hcl.colors(1), angle = 90, hjust = 0, vjust = 0) +
+  geom_vline(xintercept = 6, linewidth = .5, linetype = 'dashed', color = hcl.colors(1)) +
   theme_minimal() +
   theme(panel.grid.minor = element_blank())
 
 perp_vs_k_df %>%
   slice_min(n = 5, order_by = perplexity)
+```
+
+This method is really slow though, and doesn't seem super definitive in this case.  There
+
+### `ldatuning` package
+
+The `ldatuning` package runs four different metrics to identify a good number of topics.
+
+```{r}
+tuning_f <- here::here('int/topic_tuning.csv')
+if(!file.exists(tuning_f)) {
+  ### remotes::install_github("nikita-moor/ldatuning")
+  library(ldatuning)
+  
+  k_vec <- c(2:10, seq(12, 20, 2), seq(25, 40, 5))
+  
+  optim_topics <- FindTopicsNumber(
+    abstr_dtm, 
+    topics = k_vec, 
+    metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+    control = list(seed = 12345),
+    mc.cores = 4,
+    verbose = TRUE
+  )
+  write_csv(optim_topics, tuning_f)
+}
+
+optim_topics <- read_csv(tuning_f)
+ldatuning::FindTopicsNumber_plot(optim_topics)
+```
+
+
+
+
+## Running LDA on the full subset
+
+In the perplexity code above, we already see how to do the LDA.
+
+```{r}
+
 ```
 
 
