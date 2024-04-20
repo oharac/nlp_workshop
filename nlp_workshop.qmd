@@ -1,0 +1,262 @@
+---
+title: "Intro to Natural Language Processing"
+author: "Casey O'Hara"
+format: 
+  html:
+    embed-resources: true
+    code-folding: true
+editor: visual
+---
+
+
+# Learning Objectives
+
+* use `synthesisr` to read in and write out references in R
+* Work with text data in a tidy workflow, using `tidytext`
+* apply lemmatization to a corpus of documents to standardize words to their roots
+* apply a TF-IDF calculation to a corpus of documents to get a sense of relative word importance
+* apply a Latent Dirichlet Analysis to a corpus of documents to model topics within the corpus
+
+```{r setup}
+library(tidyverse)
+library(tidytext)
+library(synthesisr)
+library(topicmodels)
+library(ggwordcloud)
+```
+
+# Natural Language Processing
+
+Words in a text carry meaning and information.  Natural language processing is a field of CS focused on processing natural language data, like text or speech, to extract information, make meaning, and possibly even generate new data as a response.  Early NLP was rule-based, like applying a dictionary and a grammar rulebook to parse text.  Probabilistic methods using machine learning were the next big development, and that's where we'll focus.  ChatGPT and other LLMs use insanely huge neural networks, a bit beyond our scope here!
+
+For this workshop, we will use NLP to classify documents into similar categories, or "topics", based on similarities and differences among the various words found in the abstracts.
+
+We will be considering a text as a "bag of words" model, which disregards word order and grammar.  This is way easier than trying to parse complex language, but clearly misses out on a lot of information!  However, for the topic modeling we're aiming for in this workshop, where we will classify documents according to their text content, it will work fine.
+
+# Data
+
+We will be working with a bibliography exported from Web of Science, the results of a topic-level search on April 19, 2024, using the terms __"social ecological system*" AND ("commons" OR "common pool")__.  The search returned 385 documents but for this workshop, we may just choose a subset for demo purposes.  We'll also be focusing on the abstracts, so eliminate any where abstract is NA.  Finally, add a `doc_id` column for later.
+
+The `synthesisr` package is our friend here, reading and writing bibliography files in common formats - here we'll use bibtex.
+
+> Systematic review searches include multiple databases that export results in a variety of formats with overlap in coverage between databases. To streamline the process of importing, assembling, and deduplicating results, synthesisr recognizes bibliographic files exported from databases commonly used for systematic reviews and merges results into a standardized format.
+
+```{r read in data}
+refs_df_raw <- synthesisr::read_refs(here::here('data/wos_240419.bib'))
+
+refs_df <- refs_df_raw %>%
+  select(type, author, title, journal, year, keywords, abstract, times_cited) %>%
+  mutate(times_cited = as.numeric(times_cited)) %>%
+  filter(!is.na(abstract)) %>%
+  mutate(doc_id = paste0('text', 1:n()))
+```
+
+
+# Explore the data
+
+Let's examine word frequency in the abstracts of these documents.  This is all done in more depth in the `tidytext` workshop materials, including working with pdfs and sentiment analysis.  Pseudocode:
+
+* break the abstracts into words (tokenize)
+* eliminate common, uninformative words (stop words) and numbers (filter using regex)
+* examine results by frequency across all docs
+
+```{r tokenize and drop stop words}
+abstr_words_df <- refs_df %>%
+  unnest_tokens(input = 'abstract', output = 'word') %>%
+  anti_join(stop_words) %>%
+  filter(!str_detect(word, '[0-9]'))
+```
+
+```{r plot frequency across all docs}
+all_freq_df <- abstr_words_df %>%
+  group_by(word) %>%
+  summarize(n = n(), .groups = 'drop') %>%
+  slice_max(n, n = 100) %>%
+  mutate(angle = 45 * sample(-2:2, n(),
+    replace = TRUE,
+    prob = c(1, 1, 4, 1, 1)
+  ))
+
+ggplot(all_freq_df, aes(label = word, size = n)) +
+  geom_text_wordcloud(aes(angle = angle)) +
+  scale_size_area(max_size = 12) +
+  theme_minimal()
+```
+
+Note that some terms show up multiple times with slight variation: e.g., "resources" vs. "resource", "community" vs. "communities", "fishery" vs. "fisheries".  If we account for those differences actually referring to basically the same concept, how might that change the apparent importance?
+
+# Lemmatization
+
+A _lemma_ is the root form of a word.  For example, in English, the verb "to be" has many forms based on tense or person: I am, we are, she is, we were... but they have the same root.  Above, "resources" and "resource" have the same root ("resource") but one is plural.  If we condense words to their roots, we can get a better sense of their contextual frequency.
+
+Unfortunately lemmatization is not easy, but there are packages and external software to do this for us.  TreeTagger seems to be a big one for parsing parts of speech and lemmas for many languages, but requires installation of external software (which threw an error for me).  The `spaCy` package for Python is also pretty powerful and well supported, and there's an R package to run it (requiring a Python installation etc...).  Check out [https://spacy.io/](https://spacy.io/) for more details.
+
+* Install `spaCy` (e.g., `pip install spacy`) if not already in existing install
+* download language model, (e.g., `python -m spacy download en_core_web_sm`)
+
+For our purposes, I did this in advance in case you didn't feel like installing Python and such.  Check the results - note that this lemmatization software does not simply treat the abstracts as "bags of words" but accounts for grammar/parts of speech etc. in context.
+
+```{r}
+abstr_parsed_f <- here::here('data/abstr_parsed.csv')
+if(!file.exists(abstr_parsed_f)) {
+  library(spacyr)
+  
+  # spacy_install() ### installs Python (if necessary) and everything to access the spaCy package
+  
+  spacy_initialize(model = 'en_core_web_sm') 
+  
+  system.time(abstr_parsed_df <- spacy_parse(refs_df$abstract))
+
+  write_csv(abstr_parsed_df, abstr_parsed_f)
+}
+
+abstr_parsed_df <- read_csv(abstr_parsed_f)
+```
+
+## check results post-lemmatization (not run in workshop)
+
+We could at this point redo the word frequency stuff above, including word cloud to see how lemmatization affects the prevalence certain terms.  Here we can drop the stop words and punctuation (which is retained by the parser) and a few other things to clean up.
+
+```{r plot wordcloud after lemmatization}
+lemma_freq_df <- abstr_parsed_df %>%
+  anti_join(stop_words, by = c('lemma' = 'word')) %>%
+  filter(pos != 'PUNCT') %>%
+  filter(!str_detect(lemma, '[0-9\\%]')) %>%
+  filter(nchar(lemma) > 2) %>%
+  group_by(lemma) %>%
+  summarize(n = n(), .groups = 'drop') %>%
+  slice_max(n, n = 100) %>%
+  mutate(angle = 45 * sample(-2:2, n(),
+    replace = TRUE,
+    prob = c(1, 1, 4, 1, 1)
+  ))
+
+ggplot(lemma_freq_df, aes(label = lemma, size = n)) +
+  geom_text_wordcloud(aes(angle = angle)) +
+  scale_size_area(max_size = 12) +
+  theme_minimal()
+```
+
+# Term-frequency X inverse doc frequency
+
+A common metric to assess the importance and uniqueness of a word to a document in a body of documents is the product of _term frequency_ and _inverse document frequency_, or _TF-IDF_.  This can help us find key differences and similarities between documents, to classify them 
+
+* Term frequency is relative frequency of term $t$ in document $d$.  This is an indication of how important the term is to that specific document - this will range from 0 (term doesn't show up at all) to 1 (every word is that term).
+$$\text{tf}(t, d) = \frac{f_{t,d}}{\sum_{t'\in d}f_{t',d}}$$
+* Inverse document frequency is how common or rare the term $t$ is across all documents, by counting how many documents it shows up in, $n_t$, across all documents $N$.  Rare words, those that show up in only a few documents, are helpful for identifying similar documents, while common words that show up in almost everything don't help differentiate among documents.  Words that show up in literally everything will have a zero!  So, a rare word gets a higher score here.  
+$$\text{idf}(t, D) = \log\frac{N}{n_t} = -\log\frac{n_t}{N}$$
+
+The product of these helps identify words that are important *within* an abstract, but uncommon *across* all abstracts.
+
+Let's apply this to our data!
+
+```{r}
+abstr_tf <- abstr_parsed_df %>%
+  group_by(doc_id) %>%
+  mutate(word_ct = n()) %>%
+  group_by(doc_id, lemma) %>%
+  summarize(word_ct = first(word_ct),
+            term_ct = n(),
+            tf = term_ct / word_ct,
+            .groups = 'drop')
+
+abstr_idf <- abstr_parsed_df %>%
+  mutate(N = n_distinct(doc_id)) %>%
+  group_by(lemma) %>%
+  summarize(n_t = n_distinct(doc_id),
+            N = first(N),
+            idf = log(N / n_t))
+
+abstr_tfidf <- abstr_tf %>% 
+  left_join(abstr_idf, by = 'lemma') %>%
+  mutate(tfidf = tf * idf)
+```
+
+Note that certain words float to the top for certain documents, giving a sense of what might differentiate that document from all the others in the corpus of text.  While there is some cleaning up to do, note how the product eliminates or nearly eliminates stop words for us!  Though of course, we can do that manually (as well as the punctuation and numbers).
+
+# Latent Dirichlet Allocation
+
+LDA is a handy method for classifying documents without any additional info other than the texts themselves.  In other words, it is *unsupervised* machine learning.  It can cluster together documents according to similarities in term frequency between them, and differences in term frequency compared to documents in other clusters.  
+
+One way to think of it: each document is a probabilistic mixture of _one or more_ topics.  For our documents based on social-ecological systems, some topics might be fisheries, forestry, water systems, or comanagement.  For each of these topics, certain words will be more or less strongly associated with it - for these topics, perhaps "water" is strongly associated with fisheries and water systems, but weakly associated with forestry.  We don't know the topics in advance (thus "latent") but we can cluster according to word associations among the documents, and then look at those word associations to tease out what the topics might be.
+
+First, let's start with our dataframe of lemmatized abstracts, but clean it up a bit since more words (including uninformative stop words) makes it take a lot longer.  Then we will cast this to a "Document Term Matrix" that summarizes how many times each word shows up in each document (similar, but not the same, as TF-IDF) - each row a document, each column a word, and each cell the number of times that word shows up in that document.  
+
+```{r}
+abstr_clean_df <- abstr_parsed_df %>%
+  select(doc_id, lemma) %>%
+  mutate(lemma = tolower(lemma)) %>%
+  mutate(lemma = str_remove_all(lemma, '[^a-z]')) %>%
+  anti_join(stop_words, by = c('lemma' = 'word')) %>%
+  filter(nchar(lemma) > 2) %>%
+  group_by(doc_id, lemma) %>%
+  summarize(n = n(), .groups = 'drop')
+
+abstr_dtm <- cast_dtm(data = abstr_clean_df, 
+                      term = lemma, 
+                      document = doc_id,
+                      value = n)
+```
+
+Then we feed that to the LDA function to optimize its topic clusters.  But first, we need to know how many clusters we would like it to find!  From https://www.mathworks.com/help/textanalytics/ug/choose-number-of-topics-for-LDA-model.html:
+
+> To decide on a suitable number of topics, you can compare the goodness-of-fit of LDA models fit with varying numbers of topics. You can evaluate the goodness-of-fit of an LDA model by calculating the perplexity of a held-out set of documents. The perplexity indicates how well the model describes a set of documents. A lower perplexity suggests a better fit.
+
+```{r k optimization create training and testing document-term matrices}
+k_optim_file <- here('int', 'perplexity_vs_k.csv')
+
+if(!file.exists(k_optim_file)) {
+  set.seed(42)
+  test_ids <- refs_df %>%
+    slice_sample(prop = .2, replace = FALSE) %>%
+    .$doc_id
+  
+  train_ids <- refs_df %>%
+    filter(!doc_id %in% test_ids) %>%
+    .$doc_id
+  
+  # abstr_expand_df <- abstr_clean_df %>%
+  #   complete(doc_id, lemma, fill = list(n = 0))
+  
+  k_optim_test_dtm <- abstr_clean_df %>%
+    filter(doc_id %in% test_ids) %>%
+    cast_dtm(term = lemma, document = doc_id, value = n)
+  k_optim_train_dtm <- abstr_clean_df %>%
+    filter(doc_id %in% train_ids) %>%
+    cast_dtm(term = lemma, document = doc_id, value = n)
+
+  k_vec <- c(2:10)
+  
+  perp_vs_k_df <- lapply(k_vec, 
+    FUN = function(k) {
+      ### k <- k_vec[2]
+      message('Processing LDA for k = ', k, '...')
+      system.time({
+      k_optim_lda <- topicmodels::LDA(k_optim_train_dtm, k = k)
+      })
+      perp <- perplexity(object = k_optim_lda, newdata = k_optim_test_dtm)
+      
+      return(data.frame(k = k, perplexity = perp))
+    }) %>%
+    bind_rows() %>%
+    arrange(k)
+  write_csv(perp_vs_k_df, k_optim_file)
+}
+perp_vs_k_df <- read_csv(k_optim_file)
+ggplot(perp_vs_k_df, aes(x = k, y = perplexity)) +
+  geom_line(linewidth = 1, color = hcl.colors(1)) +
+  geom_vline(xintercept = c(10, 20), linewidth = .5, linetype = 'dashed', color = hcl.colors(1)) +
+  geom_text(x = 9, y = 2410, label = 'k = 10', color = hcl.colors(1), angle = 90, hjust = 0, vjust = 0) +
+  geom_text(x = 19, y = 2410, label = 'k = 20', color = hcl.colors(1), angle = 90, hjust = 0, vjust = 0) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+
+perp_vs_k_df %>%
+  slice_min(n = 5, order_by = perplexity)
+```
+
+
+
+
+
+
