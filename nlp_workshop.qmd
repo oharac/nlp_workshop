@@ -6,6 +6,9 @@ format:
     embed-resources: true
     code-folding: true
 editor: visual
+execute:
+  warning: false
+  message: false
 ---
 
 
@@ -48,8 +51,7 @@ set.seed(42) ### so we always get the same sample
 refs_df <- refs_df_raw %>%
   select(type, author, title, journal, year, keywords, abstract, times_cited) %>%
   mutate(times_cited = as.numeric(times_cited)) %>%
-  filter(!is.na(abstract)) %>%
-  # slice_sample(n = 300) %>%
+  filter(abstract != 'NA') %>%
   mutate(doc_id = paste0('text', 1:n()))
 ```
 
@@ -204,77 +206,7 @@ abstr_dtm <- cast_dtm(data = abstr_clean_df,
 
 ## How many topics?
 
-Then we feed that to the LDA function to optimize its topic clusters.  But first, we need to know how many clusters we would like it to find!  
-
-### Perplexity score
-
-From https://www.mathworks.com/help/textanalytics/ug/choose-number-of-topics-for-LDA-model.html:
-
-> To decide on a suitable number of topics, you can compare the goodness-of-fit of LDA models fit with varying numbers of topics. You can evaluate the goodness-of-fit of an LDA model by calculating the perplexity of a held-out set of documents. The perplexity indicates how well the model describes a set of documents. A lower perplexity suggests a better fit.
-
-This code chunk runs a cross validation on a subset of the overall corpus, trying LDA on a training set for a range of k values, then testing perplexity against a test set,
-
-```{r k optimization create training and testing document-term matrices}
-k_optim_file <- here::here('int', 'perplexity_vs_k.csv')
-
-if(!file.exists(k_optim_file)) {
-  set.seed(12345)
-  refs_subset <- refs_df # %>%
-    # slice_sample(n = 500)
-  
-  test_ids <- refs_subset %>%
-    slice_sample(prop = .2, replace = FALSE) %>%
-    .$doc_id
-  
-  train_ids <- refs_subset %>%
-    filter(!doc_id %in% test_ids) %>%
-    .$doc_id
-  
-  # abstr_expand_df <- abstr_clean_df %>%
-  #   complete(doc_id, lemma, fill = list(n = 0))
-  
-  test_dtm <- abstr_clean_df %>%
-    filter(doc_id %in% test_ids) %>%
-    cast_dtm(term = lemma, document = doc_id, value = n)
-  train_dtm <- abstr_clean_df %>%
-    filter(doc_id %in% train_ids) %>%
-    cast_dtm(term = lemma, document = doc_id, value = n)
-
-  k_vec <- c(2:10, seq(12, 20, 2), seq(25, 40, 5))
-  
-  perp_fxn <- function(k, train_dtm, test_dtm) {
-    message('Processing LDA for k = ', k, '...')
-    
-    lda_out <- topicmodels::LDA(train_dtm, k = k)
-    perp <- perplexity(object = lda_out, newdata = test_dtm)
-    
-    return(data.frame(k = k, perplexity = perp))
-  }
-  
-  perp_vs_k_df <- purrr::map_df(k_vec, perp_fxn, 
-                                train_dtm = train_dtm, test_dtm = test_dtm) %>%
-    bind_rows() %>%
-    arrange(k)
-  
-  write_csv(perp_vs_k_df, k_optim_file)
-}
-
-perp_vs_k_df <- read_csv(k_optim_file)
-ggplot(perp_vs_k_df, aes(x = k, y = perplexity)) +
-  geom_line(linewidth = 1, color = hcl.colors(1)) +
-  geom_vline(xintercept = 6, linewidth = .5, linetype = 'dashed', color = hcl.colors(1)) +
-  theme_minimal() +
-  theme(panel.grid.minor = element_blank())
-
-perp_vs_k_df %>%
-  slice_min(n = 5, order_by = perplexity)
-```
-
-This method is really slow though, and doesn't seem super definitive in this case.  There
-
-### `ldatuning` package
-
-The `ldatuning` package runs four different metrics to identify a good number of topics.
+Next we'll want to feed that document-term matrix to the LDA function to identify topic clusters.  But first, we need to know how many clusters we would like it to find!  The `ldatuning` package runs four different metrics to identify a good number of topics.  This takes a while (though less than manually trying each combination of k) so I've run it ahead of time and saved the results.
 
 ```{r}
 tuning_f <- here::here('int/topic_tuning.csv')
@@ -299,19 +231,90 @@ optim_topics <- read_csv(tuning_f)
 ldatuning::FindTopicsNumber_plot(optim_topics)
 ```
 
+Arun and Griffiths indices recommend 40 (or more!) topics based on strict minimization/maximization, though the marginal improvement tapers off after the first five or ten.  The Deveaud index looks like it recommends eight or nine topics, which seems better for a coarse understanding.  The CaoJuan index  drops sharply to about eight topics, then levels off.  Based on these, let's choose eight topics.
 
 
 
 ## Running LDA on the full subset
 
-In the perplexity code above, we already see how to do the LDA.
+Now we can run our LDA and get some results!  This might take a little while...
 
 ```{r}
-
+abstr_lda <- topicmodels::LDA(abstr_dtm, k = 8)
 ```
 
+With this, we can now look at which topics were identified for which articles (the probability weighting for each topic within each article), and also the terms most important to defining those topics (the probability weighting for each term within each topic)...
 
+```{r}
+### Extract topics for each doc by probability
+abstr_topics <- posterior(abstr_lda)$topic
 
+abstr_topics <- posterior(abstr_lda)$topic %>%
+  as.data.frame() %>%
+  setNames(paste0('topic', names(.))) %>%
+  mutate(doc_id = rownames(.))
 
+write_csv(abstr_topics, here::here('output/topic_by_doc.csv'))
 
+### Extract terms for each topic by probability
+abstr_terms  <- posterior(abstr_lda)$term
+
+abstr_terms  <- posterior(abstr_lda)$term %>%
+  as.data.frame() %>%
+  mutate(topic = paste('topic', rownames(.))) %>%
+  pivot_longer(cols = -topic, names_to = 'term', values_to = 'prob') %>%
+  filter(prob > 0.0001)
+
+write_csv(abstr_terms, here::here('output/term_by_topic.csv'))
+```
+
+# Summarize topic modeling!
+
+As a final step, I took the top 20 terms from each topic, and asked ChatGPT to suggest a brief topic name for each.
+
+```{r}
+top20 <- abstr_terms %>%
+  group_by(topic) %>%
+  slice_max(order_by = prob, n = 20)
+write_csv(top20, here::here('output/term_by_topic_top20.csv'))
+```
+
+ChatGPT suggested:
+
+* Topic 1: Ecological Impact and Management
+* Topic 2: Land Use and Grazing
+* Topic 3: Water Resource and Climate Change
+* Topic 4: Social System and Governance
+* Topic 5: Community Resilience and Governance
+* Topic 6: Dynamic Ecosystem Modeling
+* Topic 7: Fishery Management and Conservation
+* Topic 8: Human-Environment Interaction and Fire Ecology
+
+Now let's join the topics and the titles to see whether these make sense!  While some documents might touch on multiple topics, for simplicity here let's just assign the most likely topic to each document.
+
+```{r}
+topic_names <- c(topic1 = 'Ecological Impact and Management',
+                 topic2 = 'Land Use and Grazing',
+                 topic3 = 'Water Resource and Climate Change',
+                 topic4 = 'Social System and Governance',
+                 topic5 = 'Community Resilience and Governance',
+                 topic6 = 'Dynamic Ecosystem Modeling',
+                 topic7 = 'Fishery Management and Conservation',
+                 topic8 = 'Human-Environment Interaction and Fire Ecology')
+
+doc_topics <- abstr_topics %>%
+  pivot_longer(-doc_id, names_to = 'topic', values_to = 'prob') %>%
+  group_by(doc_id) %>%
+  slice_max(order_by = prob, n = 1) %>%
+  mutate(topic_desc = topic_names[topic])
+
+topics_titles <- refs_df %>%
+  filter(!is.na(abstract)) %>%
+  select(doc_id, title) %>%
+  left_join(doc_topics, by = 'doc_id') %>%
+  select(-doc_id) %>%
+  mutate(prob = round(prob, 3))
+
+DT::datatable(topics_titles)
+```
 
