@@ -38,20 +38,23 @@ We will be considering a text as a "bag of words" model, which disregards word o
 
 # Data
 
-We will be working with a bibliography exported from Web of Science, the results of a topic-level search on April 19, 2024, using the terms __"social ecological system*" AND ("commons" OR "common pool")__.  The search returned 385 documents but for this workshop, we may just choose a subset for demo purposes.  We'll also be focusing on the abstracts, so eliminate any where abstract is NA.  Finally, add a `doc_id` column for later.
+We will be working with a bibliography exported from Web of Science, the results of five topic-level searches on April 19, 2024, using the terms __"social ecological system*" AND [topic]__ where [topic] is one of "fisher*", "forestry", "grazing", "marine protected area*", or ("water resource*" OR "irrigation").  The searches returned 1066 unique documents with abstracts that we can use for our analysis.
 
-The `synthesisr` package is our friend here, reading and writing bibliography files in common formats - here we'll use bibtex.
+The `synthesisr` package is our friend here, reading and writing bibliography files in common formats - here we'll use bibtex format.
 
 > Systematic review searches include multiple databases that export results in a variety of formats with overlap in coverage between databases. To streamline the process of importing, assembling, and deduplicating results, synthesisr recognizes bibliographic files exported from databases commonly used for systematic reviews and merges results into a standardized format.
 
 ```{r read in data}
-refs_df_raw <- synthesisr::read_refs(here::here('data/wos_240419.bib'))
+refs_files <- list.files(here::here('data'), pattern = '.bib', full.names = TRUE)
 
-set.seed(42) ### so we always get the same sample
+refs_df_raw <- synthesisr::read_refs(refs_files)
+
 refs_df <- refs_df_raw %>%
-  select(type, author, title, journal, year, keywords, abstract, times_cited) %>%
+  select(type, author, title, journal, year, keywords, abstract, times_cited, src = filename) %>%
   mutate(times_cited = as.numeric(times_cited)) %>%
   filter(abstract != 'NA') %>%
+  distinct(author, title, year, .keep_all = TRUE) %>%
+  mutate(src = basename(src)) %>%
   mutate(doc_id = paste0('text', 1:n()))
 ```
 
@@ -117,7 +120,7 @@ if(!file.exists(abstr_parsed_f)) {
 abstr_parsed_df <- read_csv(abstr_parsed_f)
 ```
 
-## check results post-lemmatization (not run in workshop)
+## check results post-lemmatization
 
 We could at this point redo the word frequency stuff above, including word cloud to see how lemmatization affects the prevalence certain terms.  Here we can drop the stop words and punctuation (which is retained by the parser) and a few other things to clean up.
 
@@ -231,16 +234,17 @@ optim_topics <- read_csv(tuning_f)
 ldatuning::FindTopicsNumber_plot(optim_topics)
 ```
 
-Arun and Griffiths indices recommend 40 (or more!) topics based on strict minimization/maximization, though the marginal improvement tapers off after the first five or ten.  The Deveaud index looks like it recommends eight or nine topics, which seems better for a coarse understanding.  The CaoJuan index  drops sharply to about eight topics, then levels off.  Based on these, let's choose eight topics.
+Arun and Griffiths indices always seem to recommend MORE topics based on strict minimization/maximization, though the marginal improvement tapers off after the first five or ten.  The Deveaud index looks like it recommends ten topics, which seems better for a coarse understanding.  The CaoJuan index drops sharply to four, then less steeply to 10.  Based on these, let's choose 10 topics.
 
 
 
 ## Running LDA on the full subset
 
-Now we can run our LDA and get some results!  This might take a little while...
+Now we can run our LDA and get some results!  This might take a little while...  Annoyingly, even though we set a random number seed, this process results in a different clustering each time!
 
 ```{r}
-abstr_lda <- topicmodels::LDA(abstr_dtm, k = 8)
+set.seed(42)
+abstr_lda <- topicmodels::LDA(abstr_dtm, k = 10)
 ```
 
 With this, we can now look at which topics were identified for which articles (the probability weighting for each topic within each article), and also the terms most important to defining those topics (the probability weighting for each term within each topic)...
@@ -279,30 +283,35 @@ top20 <- abstr_terms %>%
 write_csv(top20, here::here('output/term_by_topic_top20.csv'))
 ```
 
-ChatGPT suggested:
+But, note again that LDA is not deterministic, so even with a random generator seed, the results are different every time.  For a test run (see the output folder), based on the top 20 terms for each topic and their associated probabilities, ChatGPT suggested:
 
-* Topic 1: Ecological Impact and Management
-* Topic 2: Land Use and Grazing
-* Topic 3: Water Resource and Climate Change
-* Topic 4: Social System and Governance
-* Topic 5: Community Resilience and Governance
-* Topic 6: Dynamic Ecosystem Modeling
-* Topic 7: Fishery Management and Conservation
-* Topic 8: Human-Environment Interaction and Fire Ecology
+* Topic 1: Water Resource Governance
+* Topic 2: Dynamic Water System Management
+* Topic 3: Urban Ecological Resilience
+* Topic 4: Climate Change Impact and Adaptation
+* Topic 5: Community Resilience in Land Management
+* Topic 6: Marine Ecosystem and Fishery Management
+* Topic 7: Social-Ecological Frameworks for Research
+* Topic 8: Stakeholder-Centric Conservation Planning
+* Topic 9: Ecosystem Services in Landscape Conservation
+* Topic 10: Sustainable Water Management Modeling
 
 Now let's join the topics and the titles to see whether these make sense!  While some documents might touch on multiple topics, for simplicity here let's just assign the most likely topic to each document.
 
 ```{r}
-topic_names <- c(topic1 = 'Ecological Impact and Management',
-                 topic2 = 'Land Use and Grazing',
-                 topic3 = 'Water Resource and Climate Change',
-                 topic4 = 'Social System and Governance',
-                 topic5 = 'Community Resilience and Governance',
-                 topic6 = 'Dynamic Ecosystem Modeling',
-                 topic7 = 'Fishery Management and Conservation',
-                 topic8 = 'Human-Environment Interaction and Fire Ecology')
+topic_names <- c(topic1 = 'Water Resource Governance',
+                 topic2 = 'Dynamic Water System Management',
+                 topic3 = 'Urban Ecological Resilience',
+                 topic4 = 'Climate Change Impact and Adaptation',
+                 topic5 = 'Community Resilience in Land Management',
+                 topic6 = 'Marine Ecosystem and Fishery Management',
+                 topic7 = 'Social-Ecological Frameworks for Research',
+                 topic8 = 'Stakeholder-Centric Conservation Planning',
+                 topic9 = 'Ecosystem Services in Landscape Conservation',
+                 topic10 = 'Sustainable Water Management Modeling')
 
-doc_topics <- abstr_topics %>%
+abstr_topics_testrun <- read_csv(here::here('output/topic_by_doc_testrun.csv'))
+doc_topics <- abstr_topics_testrun %>%
   pivot_longer(-doc_id, names_to = 'topic', values_to = 'prob') %>%
   group_by(doc_id) %>%
   slice_max(order_by = prob, n = 1) %>%
@@ -310,10 +319,15 @@ doc_topics <- abstr_topics %>%
 
 topics_titles <- refs_df %>%
   filter(!is.na(abstract)) %>%
-  select(doc_id, title) %>%
+  select(doc_id, title, src) %>%
   left_join(doc_topics, by = 'doc_id') %>%
   select(-doc_id) %>%
   mutate(prob = round(prob, 3))
+
+ggplot(topics_titles, aes(y = topic_desc, fill = src)) +
+  geom_bar() +
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
 
 DT::datatable(topics_titles)
 ```
