@@ -6,6 +6,9 @@ format:
     embed-resources: true
     code-folding: true
 editor: visual
+execute:
+  warning: false
+  message: false
 ---
 
 # Learning Objectives
@@ -34,19 +37,23 @@ We will be considering a text as a "bag of words" model, which disregards word o
 
 # Data
 
-We will be working with a bibliography exported from Web of Science, the results of a topic-level search on April 19, 2024, using the terms \_\_"social ecological system\*" AND ("commons" OR "common pool")\_\_. The search returned 385 documents but for this workshop, we may just choose a subset for demo purposes. We'll also be focusing on the abstracts, so eliminate any where abstract is NA. Finally, add a `doc_id` column for later.
+We will be working with a bibliography exported from Web of Science, the results of five topic-level searches on April 19, 2024, using the terms __"social ecological system*" AND [topic]__ where [topic] is one of "fisher\*", "forestry", "grazing", "marine protected area\*", or ("water resource\*" OR "irrigation").  The searches returned 1066 unique documents with abstracts that we can use for our analysis.
 
-The `synthesisr` package is our friend here, reading and writing bibliography files in common formats - here we'll use bibtex.
+The `synthesisr` package is our friend here, reading and writing bibliography files in common formats - here we'll use bibtex format.
 
 > Systematic review searches include multiple databases that export results in a variety of formats with overlap in coverage between databases. To streamline the process of importing, assembling, and deduplicating results, synthesisr recognizes bibliographic files exported from databases commonly used for systematic reviews and merges results into a standardized format.
 
 ```{r read in data}
-refs_df_raw <- synthesisr::read_refs(here::here('data/wos_240419.bib'))
+refs_files <- list.files(here::here('data'), pattern = '.bib', full.names = TRUE)
+
+refs_df_raw <- synthesisr::read_refs(refs_files)
 
 refs_df <- refs_df_raw %>%
-  select(type, author, title, journal, year, keywords, abstract, times_cited) %>%
+  select(type, author, title, journal, year, keywords, abstract, times_cited, src = filename) %>%
   mutate(times_cited = as.numeric(times_cited)) %>%
-  filter(!is.na(abstract)) %>%
+  filter(abstract != 'NA') %>%
+  distinct(author, title, year, .keep_all = TRUE) %>%
+  mutate(src = basename(src)) %>%
   mutate(doc_id = paste0('text', 1:n()))
 ```
 
@@ -95,7 +102,7 @@ Unfortunately lemmatization is not easy, but there are packages and external sof
 For our purposes, I did this in advance in case you didn't feel like installing Python and such. Check the results - note that this lemmatization software does not simply treat the abstracts as "bags of words" but accounts for grammar/parts of speech etc. in context.
 
 ```{r}
-abstr_parsed_f <- here::here('data/abstr_parsed.csv')
+abstr_parsed_f <- here::here('int/abstr_parsed.csv')
 if(!file.exists(abstr_parsed_f)) {
   library(spacyr)
   
@@ -111,7 +118,7 @@ if(!file.exists(abstr_parsed_f)) {
 abstr_parsed_df <- read_csv(abstr_parsed_f)
 ```
 
-## check results post-lemmatization (not run in workshop)
+## check results post-lemmatization
 
 We could at this point redo the word frequency stuff above, including word cloud to see how lemmatization affects the prevalence certain terms. Here we can drop the stop words and punctuation (which is retained by the parser) and a few other things to clean up.
 
@@ -177,7 +184,9 @@ LDA is a handy method for classifying documents without any additional info othe
 
 One way to think of it: each document is a probabilistic mixture of *one or more* topics. For our documents based on social-ecological systems, some topics might be fisheries, forestry, water systems, or comanagement. For each of these topics, certain words will be more or less strongly associated with it - for these topics, perhaps "water" is strongly associated with fisheries and water systems, but weakly associated with forestry. We don't know the topics in advance (thus "latent") but we can cluster according to word associations among the documents, and then look at those word associations to tease out what the topics might be.
 
-First, let's start with our dataframe of lemmatized abstracts, but clean it up a bit since more words (including uninformative stop words) makes it take a lot longer. Then we will cast this to a "Document Term Matrix" that summarizes how many times each word shows up in each document (similar, but not the same, as TF-IDF) - each row a document, each column a word, and each cell the number of times that word shows up in that document.
+## Get data into proper format
+
+First, let's start with our dataframe of lemmatized abstracts, but clean it up a bit since more words (including uninformative stop words) makes it take a lot longer.  Then we will cast this to a "Document Term Matrix" that summarizes how many times each word shows up in each document (similar, but not the same, as TF-IDF) - each row a document, each column a word, and each cell the number of times that word shows up in that document.  
 
 ```{r}
 abstr_clean_df <- abstr_parsed_df %>%
@@ -195,60 +204,128 @@ abstr_dtm <- cast_dtm(data = abstr_clean_df,
                       value = n)
 ```
 
-Then we feed that to the LDA function to optimize its topic clusters. But first, we need to know how many clusters we would like it to find! From https://www.mathworks.com/help/textanalytics/ug/choose-number-of-topics-for-LDA-model.html:
+## How many topics?
 
-> To decide on a suitable number of topics, you can compare the goodness-of-fit of LDA models fit with varying numbers of topics. You can evaluate the goodness-of-fit of an LDA model by calculating the perplexity of a held-out set of documents. The perplexity indicates how well the model describes a set of documents. A lower perplexity suggests a better fit.
+Next we'll want to feed that document-term matrix to the LDA function to identify topic clusters.  But first, we need to know how many clusters we would like it to find!  The `ldatuning` package runs four different metrics to identify a good number of topics.  This takes a while (though less than manually trying each combination of k) so I've run it ahead of time and saved the results.
 
-```{r k optimization create training and testing document-term matrices}
-#| message: true
-
-k_optim_file <- here::here('int', 'perplexity_vs_k.csv')
-
-if(!file.exists(k_optim_file)) {
-  set.seed(42)
-  test_ids <- refs_df %>%
-    slice_sample(prop = .2, replace = FALSE) %>%
-    .$doc_id
+```{r}
+tuning_f <- here::here('int/topic_tuning.csv')
+if(!file.exists(tuning_f)) {
+  ### remotes::install_github("nikita-moor/ldatuning")
+  library(ldatuning)
   
-  train_ids <- refs_df %>%
-    filter(!doc_id %in% test_ids) %>%
-    .$doc_id
+  k_vec <- c(2:10, seq(12, 20, 2), seq(25, 40, 5))
   
-  k_optim_test_dtm <- abstr_clean_df %>%
-    filter(doc_id %in% test_ids) %>%
-    cast_dtm(term = lemma, document = doc_id, value = n)
-  k_optim_train_dtm <- abstr_clean_df %>%
-    filter(doc_id %in% train_ids) %>%
-    cast_dtm(term = lemma, document = doc_id, value = n)
-
-  k_vec <- c(2:10, seq(12, 20, 2), seq(25, 50, 5))
-  
-  perp_vs_k_df <- parallel::mclapply(
-    X = sample(k_vec, length(k_vec), replace = FALSE),
-    mc.cores = 3,
-    FUN = function(k) {
-      ### k <- k_vec[2]
-      message('Processing LDA for k = ', k, '...')
-      k_optim_lda <- topicmodels::LDA(k_optim_train_dtm, k = k)
-      perp <- perplexity(object = k_optim_lda, newdata = k_optim_test_dtm)
-      
-      return(data.frame(k = k, perplexity = perp))
-    }) %>%
-    bind_rows() %>%
-    arrange(k)
-  
-  write_csv(perp_vs_k_df, k_optim_file)
+  optim_topics <- FindTopicsNumber(
+    abstr_dtm, 
+    topics = k_vec, 
+    metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+    control = list(seed = 12345),
+    mc.cores = 4,
+    verbose = TRUE
+  )
+  write_csv(optim_topics, tuning_f)
 }
 
-perp_vs_k_df <- read_csv(k_optim_file)
-ggplot(perp_vs_k_df, aes(x = k, y = perplexity)) +
-  geom_line(linewidth = 1, color = hcl.colors(1)) +
-  geom_vline(xintercept = c(10, 20), linewidth = .5, linetype = 'dashed', color = hcl.colors(1)) +
-  geom_text(x = 9, y = 2410, label = 'k = 10', color = hcl.colors(1), angle = 90, hjust = 0, vjust = 0) +
-  geom_text(x = 19, y = 2410, label = 'k = 20', color = hcl.colors(1), angle = 90, hjust = 0, vjust = 0) +
-  theme_minimal() +
-  theme(panel.grid.minor = element_blank())
-
-perp_vs_k_df %>%
-  slice_min(n = 5, order_by = perplexity)
+optim_topics <- read_csv(tuning_f)
+ldatuning::FindTopicsNumber_plot(optim_topics)
 ```
+
+Arun and Griffiths indices always seem to recommend MORE topics based on strict minimization/maximization, though the marginal improvement tapers off after the first five or ten.  The Deveaud index looks like it recommends ten topics, which seems better for a coarse understanding.  The CaoJuan index drops sharply to four, then less steeply to 10.  Based on these, let's choose 10 topics.
+
+
+
+## Running LDA on the full subset
+
+Now we can run our LDA and get some results!  This might take a little while...  Annoyingly, even though we set a random number seed, this process results in a different clustering each time!
+
+```{r}
+set.seed(42)
+abstr_lda <- topicmodels::LDA(abstr_dtm, k = 10)
+```
+
+With this, we can now look at which topics were identified for which articles (the probability weighting for each topic within each article), and also the terms most important to defining those topics (the probability weighting for each term within each topic)...
+
+```{r}
+### Extract topics for each doc by probability
+abstr_topics <- posterior(abstr_lda)$topic
+
+abstr_topics <- posterior(abstr_lda)$topic %>%
+  as.data.frame() %>%
+  setNames(paste0('topic', names(.))) %>%
+  mutate(doc_id = rownames(.))
+
+write_csv(abstr_topics, here::here('output/topic_by_doc.csv'))
+
+### Extract terms for each topic by probability
+abstr_terms  <- posterior(abstr_lda)$term
+
+abstr_terms  <- posterior(abstr_lda)$term %>%
+  as.data.frame() %>%
+  mutate(topic = paste('topic', rownames(.))) %>%
+  pivot_longer(cols = -topic, names_to = 'term', values_to = 'prob') %>%
+  filter(prob > 0.0001)
+
+write_csv(abstr_terms, here::here('output/term_by_topic.csv'))
+```
+
+# Summarize topic modeling!
+
+As a final step, I took the top 20 terms from each topic, and asked ChatGPT to suggest a brief topic name for each.
+
+```{r}
+top20 <- abstr_terms %>%
+  group_by(topic) %>%
+  slice_max(order_by = prob, n = 20)
+write_csv(top20, here::here('output/term_by_topic_top20.csv'))
+```
+
+But, note again that LDA is not deterministic, so even with a random generator seed, the results are different every time.  For a test run (see the output folder), based on the top 20 terms for each topic and their associated probabilities, ChatGPT suggested:
+
+* Topic 1: Water Resource Governance
+* Topic 2: Dynamic Water System Management
+* Topic 3: Urban Ecological Resilience
+* Topic 4: Climate Change Impact and Adaptation
+* Topic 5: Community Resilience in Land Management
+* Topic 6: Marine Ecosystem and Fishery Management
+* Topic 7: Social-Ecological Frameworks for Research
+* Topic 8: Stakeholder-Centric Conservation Planning
+* Topic 9: Ecosystem Services in Landscape Conservation
+* Topic 10: Sustainable Water Management Modeling
+
+Now let's join the topics and the titles to see whether these make sense!  While some documents might touch on multiple topics, for simplicity here let's just assign the most likely topic to each document.
+
+```{r}
+topic_names <- c(topic1 = 'Water Resource Governance',
+                 topic2 = 'Dynamic Water System Management',
+                 topic3 = 'Urban Ecological Resilience',
+                 topic4 = 'Climate Change Impact and Adaptation',
+                 topic5 = 'Community Resilience in Land Management',
+                 topic6 = 'Marine Ecosystem and Fishery Management',
+                 topic7 = 'Social-Ecological Frameworks for Research',
+                 topic8 = 'Stakeholder-Centric Conservation Planning',
+                 topic9 = 'Ecosystem Services in Landscape Conservation',
+                 topic10 = 'Sustainable Water Management Modeling')
+
+abstr_topics_testrun <- read_csv(here::here('output/topic_by_doc_testrun.csv'))
+doc_topics <- abstr_topics_testrun %>%
+  pivot_longer(-doc_id, names_to = 'topic', values_to = 'prob') %>%
+  group_by(doc_id) %>%
+  slice_max(order_by = prob, n = 1) %>%
+  mutate(topic_desc = topic_names[topic])
+
+topics_titles <- refs_df %>%
+  filter(!is.na(abstract)) %>%
+  select(doc_id, title, src) %>%
+  left_join(doc_topics, by = 'doc_id') %>%
+  select(-doc_id) %>%
+  mutate(prob = round(prob, 3))
+
+ggplot(topics_titles, aes(y = topic_desc, fill = src)) +
+  geom_bar() +
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
+
+DT::datatable(topics_titles)
+```
+
